@@ -996,10 +996,21 @@ func loadConfig() (Config, error) {
 	}
 
 	if config.DufsURL == "" {
-		return config, fmt.Errorf("DUFS_URL environment variable is required")
-	}
-
-	return config, nil
+        return config, fmt.Errorf("DUFS_URL environment variable is required")
+    }
+    u, err := url.Parse(config.DufsURL)
+    if err != nil || (u.Scheme != "http" && u.Scheme != "https") ||
+        u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+        return config, fmt.Errorf("DUFS_URL must be an HTTP(S) URL without embedded credentials or query")
+    }
+    if u.Scheme == "http" && !config.AllowInsecure {
+        host := u.Hostname()
+        ip := net.ParseIP(host)
+        if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+            return config, fmt.Errorf("DUFS_URL requires HTTPS outside loopback; explicitly opt in with DUFS_ALLOW_INSECURE=true")
+        }
+    }
+    return config, nil
 }
 
 // runStdioMode 运行 stdio 模式（标准 MCP 协议）
@@ -1059,60 +1070,62 @@ func runStdioMode(server *MCPServer) {
 	}
 }
 
-// runHTTPMode 运行 HTTP/SSE 模式
+// Legacy /message JSON-RPC is authenticated. This is not Streamable HTTP/SSE MCP.
+func newMCPHTTPHandler(server *MCPServer, token string) http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+        http.Error(w, "SSE MCP transport not implemented; use stdio", http.StatusNotImplemented)
+    })
+    mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            w.Header().Set("Allow", "POST")
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+        var msg MCPMessage
+        if err := dec.Decode(&msg); err != nil || msg.JSONRPC != "2.0" || msg.Method == "" {
+            http.Error(w, "invalid JSON-RPC request", http.StatusBadRequest)
+            return
+        }
+        if msg.ID == nil { w.WriteHeader(http.StatusAccepted); return }
+        _ = json.NewEncoder(w).Encode(server.handleMessage(msg))
+    })
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("X-Content-Type-Options", "nosniff")
+        w.Header().Set("Cache-Control", "no-store")
+        if r.Header.Get("Origin") != "" {
+            http.Error(w, "browser-origin calls not allowed", http.StatusForbidden)
+            return
+        }
+        auth := r.Header.Get("Authorization")
+        if !strings.HasPrefix(auth, "Bearer ") ||
+            subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(token)) != 1 {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
+}
+
 func runHTTPMode(server *MCPServer, port string) {
-	// SSE 端点：用于接收服务器推送的消息
-	http.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
-		// 设置 SSE headers
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "SSE not supported", http.StatusInternalServerError)
-			return
-		}
-
-		// 发送初始连接消息
-		fmt.Fprintf(w, "data: %s\n\n", `{"type":"connection","status":"connected"}`)
-		flusher.Flush()
-
-		// 保持连接打开，等待客户端关闭
-		<-r.Context().Done()
-	})
-
-	// 接收客户端消息的端点
-	http.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var msg MCPMessage
-		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		response := server.handleMessage(msg)
-		json.NewEncoder(w).Encode(response)
-	})
-
-	log.Printf("MCP Server (HTTP mode) starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+    token := os.Getenv("MCP_HTTP_TOKEN")
+    if len(token) < 32 { log.Fatal("MCP_HTTP_TOKEN >= 32 characters is required in HTTP mode") }
+    bind := os.Getenv("MCP_HTTP_BIND")
+    if bind == "" { bind = "127.0.0.1:" + port }
+    host, _, err := net.SplitHostPort(bind)
+    if err != nil { log.Fatalf("invalid MCP_HTTP_BIND: %v", err) }
+    ip := net.ParseIP(host)
+    if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !enabled("MCP_HTTP_ALLOW_REMOTE") {
+        log.Fatal("remote binding requires MCP_HTTP_ALLOW_REMOTE=true and authenticated TLS termination")
+    }
+    srv := &http.Server{
+        Addr: bind, Handler: newMCPHTTPHandler(server, token),
+        ReadHeaderTimeout: 10*time.Second, IdleTimeout: 60*time.Second,
+    }
+    log.Printf("Authenticated legacy MCP JSON-RPC listening on %s", bind)
+    log.Fatal(srv.ListenAndServe())
 }
 
 func main() {
