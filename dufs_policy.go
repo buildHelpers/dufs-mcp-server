@@ -173,6 +173,13 @@ func (s *MCPServer) authorizeTool(name string, args map[string]interface{}) erro
             p = "/" + s.remoteRoot()
             args["path"] = p
         }
+        format, _ := args["format"].(string)
+        if format != "" && format != "json" && format != "simple" {
+            return fmt.Errorf("invalid list format")
+        }
+        if query, ok := args["query"].(string); ok && len(query) > 256 {
+            return fmt.Errorf("search query too long")
+        }
         return s.validateRemote(p)
     case "dufs_get_hash":
         return checkRemote("path")
