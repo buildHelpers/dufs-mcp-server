@@ -446,44 +446,30 @@ func (s *MCPServer) resolveRemotePath(localPath, remotePath string) string {
 }
 
 func (s *MCPServer) ensureRemoteDirectories(remotePath string) error {
-	remoteDir := remotePath
-	if idx := strings.LastIndex(remotePath, "/"); idx >= 0 {
-		remoteDir = remotePath[:idx]
-	}
-
-	if remoteDir == "" {
-		return nil
-	}
-
-	parts := strings.Split(strings.TrimPrefix(remoteDir, "/"), "/")
-	current := ""
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		if current == "" {
-			current = part
-		} else {
-			current = current + "/" + part
-		}
-
-		resp, err := s.dufsClient.makeRequest("MKCOL", current, nil, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create remote directory %s: %w", current, err)
-		}
-		func() {
-			defer resp.Body.Close()
-			if (resp.StatusCode < 200 || resp.StatusCode >= 300) && resp.StatusCode != http.StatusMethodNotAllowed {
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-				err = fmt.Errorf("create directory failed with status %d: %s", resp.StatusCode, string(body))
-			}
-		}()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+    if err := s.validateRemote(remotePath); err != nil { return err }
+    root := s.remoteRoot()
+    remoteDir := remotePath
+    if idx := strings.LastIndex(remotePath, "/"); idx >= 0 { remoteDir = remotePath[:idx] }
+    remoteDir = strings.TrimPrefix(remoteDir, "/")
+    // A project's namespace is provisioned by the Dufs administrator.
+    // An MCP account scoped to /projects/name must not need MKCOL /projects.
+    if remoteDir == root { return nil }
+    if !strings.HasPrefix(remoteDir, root+"/") { return fmt.Errorf("remote directory outside project root") }
+    relative := strings.TrimPrefix(remoteDir, root+"/")
+    current := root
+    for _, part := range strings.Split(relative, "/") {
+        if part == "" { return fmt.Errorf("invalid remote directory") }
+        current += "/" + part
+        resp, err := s.dufsClient.makeRequest("MKCOL", current, nil, nil)
+        if err != nil { return fmt.Errorf("failed to create remote directory: %w", err) }
+        status := resp.StatusCode
+        resp.Body.Close()
+        // Dufs returns 405 for a directory that already exists.
+        if (status < 200 || status >= 300) && status != http.StatusMethodNotAllowed {
+            return fmt.Errorf("failed to create remote directory %s: HTTP %d", current, status)
+        }
+    }
+    return nil
 }
 
 func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, error) {
@@ -494,15 +480,10 @@ func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, er
 	finalRemotePath := s.resolveRemotePath(localPath, remotePath)
     if err := s.validateRemote(finalRemotePath); err != nil { return "", 0, err }
 
-    if err := s.ensureRemoteDirectories(finalRemotePath); err != nil {
-		return "", 0, err
-	}
-
-	file, err := openScopedInput(localPath)
-    if err != nil {
-        return "", 0, fmt.Errorf("invalid upload source: %v", err)
-    }
-	defer file.Close()
+    file, err := openScopedInput(localPath)
+    if err != nil { return "", 0, fmt.Errorf("invalid upload source: %v", err) }
+    defer file.Close()
+    if err := s.ensureRemoteDirectories(finalRemotePath); err != nil { return "", 0, err }
 
 	resp, err := s.dufsClient.makeRequest("PUT", finalRemotePath, file, nil)
 	if err != nil {
