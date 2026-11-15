@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/subtle"
+	"net"
+	"net/url"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,7 +83,8 @@ func NewDufsClient(config Config) *DufsClient {
 		Username: config.Username,
 		Password: config.Password,
 		Client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 10 * time.Minute,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -343,6 +347,13 @@ func (s *MCPServer) handleToolsList(params json.RawMessage) (interface{}, error)
 	}, nil
 }
 
+func toolCallError(err error) (interface{}, error) {
+    return map[string]interface{}{
+        "content": []map[string]string{{"type": "text", "text": err.Error()}},
+        "isError": true,
+    }, nil
+}
+
 func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error) {
 	var callParams struct {
 		Name      string                 `json:"name"`
@@ -352,10 +363,13 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error)
 		return nil, fmt.Errorf("invalid parameters: %v", err)
 	}
 
-	var result interface{}
-	var err error
+	if err := s.authorizeTool(callParams.Name, callParams.Arguments); err != nil {
+        return toolCallError(err)
+    }
+    var result interface{}
+    var err error
 
-	switch callParams.Name {
+    switch callParams.Name {
 	case "dufs_upload":
 		result, err = s.handleUpload(callParams.Arguments)
 	case "dufs_upload_batch":
@@ -383,10 +397,10 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error)
 	}
 
 	if err != nil {
-		return nil, err
-	}
+        return toolCallError(err)
+    }
 
-	// 根据 MCP 协议，tools/call 的返回格式应该是包含 content 数组的对象
+    // 根据 MCP 协议，tools/call 的返回格式应该是包含 content 数组的对象
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal result: %v", err)
@@ -412,10 +426,7 @@ func (s *MCPServer) resolveRemotePath(localPath, remotePath string) string {
 	now := time.Now()
 	dateDir := now.Format("20060102")
 
-	baseDir := strings.TrimPrefix(s.config.UploadDir, "/")
-	if baseDir == "" {
-		baseDir = "uploads"
-	}
+	baseDir := s.remoteRoot()
 
 	return fmt.Sprintf("%s/%s/%s", baseDir, dateDir, fileName)
 }
@@ -467,15 +478,16 @@ func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, er
 	}
 
 	finalRemotePath := s.resolveRemotePath(localPath, remotePath)
+    if err := s.validateRemote(finalRemotePath); err != nil { return "", 0, err }
 
-	if err := s.ensureRemoteDirectories(finalRemotePath); err != nil {
+    if err := s.ensureRemoteDirectories(finalRemotePath); err != nil {
 		return "", 0, err
 	}
 
-	file, err := os.Open(localPath)
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to open file: %v", err)
-	}
+	file, err := openScopedInput(localPath)
+    if err != nil {
+        return "", 0, fmt.Errorf("invalid upload source: %v", err)
+    }
 	defer file.Close()
 
 	resp, err := s.dufsClient.makeRequest("PUT", finalRemotePath, file, nil)
@@ -484,10 +496,9 @@ func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, er
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", resp.StatusCode, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return "", resp.StatusCode, fmt.Errorf("upload failed with HTTP %d", resp.StatusCode)
+    }
 
 	return finalRemotePath, resp.StatusCode, nil
 }
@@ -521,8 +532,20 @@ func (s *MCPServer) handleUpload(args map[string]interface{}) (interface{}, erro
 		}
 
 		s.jobsMutex.Lock()
-		s.jobs[jobID] = job
-		s.jobsMutex.Unlock()
+    if len(s.jobs) >= 128 {
+        for k, old := range s.jobs {
+            if old.Status == "completed" || old.Status == "failed" {
+                delete(s.jobs, k)
+            }
+            if len(s.jobs) < 96 { break }
+        }
+    }
+    if len(s.jobs) >= 128 {
+        s.jobsMutex.Unlock()
+        return nil, fmt.Errorf("upload task capacity reached")
+    }
+    s.jobs[jobID] = job
+    s.jobsMutex.Unlock()
 
 		go s.runUploadJob(job)
 
@@ -627,8 +650,20 @@ func (s *MCPServer) handleUploadBatch(args map[string]interface{}) (interface{},
 	}
 
 	s.jobsMutex.Lock()
-	s.jobs[jobID] = job
-	s.jobsMutex.Unlock()
+    if len(s.jobs) >= 128 {
+        for k, old := range s.jobs {
+            if old.Status == "completed" || old.Status == "failed" {
+                delete(s.jobs, k)
+            }
+            if len(s.jobs) < 96 { break }
+        }
+    }
+    if len(s.jobs) >= 128 {
+        s.jobsMutex.Unlock()
+        return nil, fmt.Errorf("upload task capacity reached")
+    }
+    s.jobs[jobID] = job
+    s.jobsMutex.Unlock()
 
 	go s.runUploadJob(job)
 
