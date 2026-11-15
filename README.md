@@ -141,6 +141,61 @@ printf '验证通过: %s %s\n' "${REMOTE}" "${LOCAL_SHA}"
 
 外网下载必须单独在 Caddy 配置只读路由、身份验证及 TLS，且禁止匿名下载、目录列表和写入请求。**本 PR 没有部署 Dufs/Caddy，也没有修改 APIOS PR #59 的工作流**。上面只是一段首次联调命令；接入 APIOS 时仍应保留其已有的本机归档、清单、SHA-256 校验和失败阻断逻辑。
 
+## 下载已上传的 CI 制品
+
+CI 上传使用的远端文件路径（`REMOTE`）必须写入归档清单；仅有运行编号不足以猜出随机 ID。以下示例使用某次上传后的完整路径：
+
+```bash
+REMOTE="projects/apios/20261115/123456/1/a8f39c2d/package.zip"
+```
+
+### 方式一：内网直接从 Dufs 下载
+
+在能访问 Dufs 内网地址的机器上，使用**只读账号**通过 GET 下载：
+
+```bash
+: "${DUFS_INTERNAL_URL:?}" "${DUFS_READ_USER:?}" "${DUFS_READ_PASSWORD:?}"
+curl --fail-with-body --show-error --silent \
+  --user "${DUFS_READ_USER}:${DUFS_READ_PASSWORD}" \
+  --output package.zip \
+  "${DUFS_INTERNAL_URL%/}/${REMOTE}"
+```
+
+示例环境：Dufs 本机可设置 `DUFS_INTERNAL_URL=http://127.0.0.1:5000`；远端 Runner 必须使用它实际能连通的内网 URL，**不能**指向 Runner 自己的 127.0.0.1。
+
+### 方式二：外网通过 Caddy 的认证下载域名
+
+正式部署时，Caddy 接收外网 HTTPS 请求并要求用户认证，然后用**单独的只读上游身份**向 Dufs 读取文件。外部下载 URI 与 Dufs 相同，只有主机名不同，例如：
+
+```text
+https://files.example.com/projects/apios/20261115/123456/1/a8f39c2d/package.zip
+```
+
+浏览器打开链接完成登录后即可下载；命令行客户端应按实际部署的认证机制传入凭据。若采用 Caddy Basic Auth：
+
+```bash
+: "${DUFS_PUBLIC_URL:?}" "${DOWNLOAD_USER:?}" "${DOWNLOAD_PASSWORD:?}"
+curl --fail-with-body --show-error --silent \
+  --user "${DOWNLOAD_USER}:${DOWNLOAD_PASSWORD}" \
+  --output package.zip \
+  "${DUFS_PUBLIC_URL%/}/${REMOTE}"
+```
+
+**Caddy 必须先部署好才能使用此链接**：只放行认证后的制品文件 `GET` / `HEAD`，拒绝全部写入方法、目录访问及目录搜索/列表 URL，强制 HTTPS。若 Caddy 和 Dufs 使用不同的凭据体系，代理必须使用专属 Dufs 只读上游凭据，不应直接转发具有写权限的外部身份。不能把随机文件名当作认证。
+
+### 验证下载文件
+
+将下载后的 `package.zip` 与 CI 归档清单记录的原始 SHA-256 对比，不能仅凭收到 HTTP 200 就认为校验通过：
+
+```bash
+: "${EXPECTED_SHA256:?请从 CI 制品清单读取原始哈希}"
+test "$(sha256sum package.zip | awk '{print $1}')" = "${EXPECTED_SHA256}" \
+  || { echo '下载的制品哈希校验失败' >&2; exit 1; }
+echo "下载与 SHA-256 验证成功"
+```
+
+上例的 URL、账号、凭据、路径与哈希均为占位示例；**本 PR 尚未配置外网域名，也没有实际部署 Dufs/Caddy 或执行外网下载验收**。
+
 ## 快速上手：智能体使用 MCP
 
 ```bash
