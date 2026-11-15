@@ -117,6 +117,7 @@ type MCPServer struct {
 	config     Config
 	jobs       map[string]*UploadJob
 	jobsMutex  sync.RWMutex
+    uploadSlots chan struct{}
 }
 
 func NewMCPServer(config Config) *MCPServer {
@@ -326,6 +327,7 @@ func NewMCPServer(config Config) *MCPServer {
 		tools:      tools,
 		config:     config,
 		jobs:       make(map[string]*UploadJob),
+        uploadSlots: make(chan struct{}, 4),
 	}
 }
 
@@ -427,8 +429,15 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error)
 				"text": string(resultJSON),
 			},
 		},
-		"isError": false,
-	}, nil
+		"isError": toolResultFailed(result),
+    }, nil
+}
+
+func toolResultFailed(result interface{}) bool {
+    m, ok := result.(map[string]interface{})
+    if !ok { return false }
+    success, present := m["success"].(bool)
+    return present && !success
 }
 
 func (s *MCPServer) resolveRemotePath(localPath, remotePath string) string {
@@ -473,11 +482,15 @@ func (s *MCPServer) ensureRemoteDirectories(remotePath string) error {
 }
 
 func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, error) {
-	if localPath == "" {
-		return "", 0, fmt.Errorf("local_path is required")
-	}
+	if localPath == "" { return "", 0, fmt.Errorf("local_path is required") }
+    select {
+    case s.uploadSlots <- struct{}{}:
+        defer func() { <-s.uploadSlots }()
+    case <-time.After(30*time.Second):
+        return "", 0, fmt.Errorf("MCP upload concurrency limit reached")
+    }
 
-	finalRemotePath := s.resolveRemotePath(localPath, remotePath)
+    finalRemotePath := s.resolveRemotePath(localPath, remotePath)
     if err := s.validateRemote(finalRemotePath); err != nil { return "", 0, err }
 
     file, err := openScopedInput(localPath)
