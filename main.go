@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/subtle"
+	"net"
+	"net/url"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,7 +83,8 @@ func NewDufsClient(config Config) *DufsClient {
 		Username: config.Username,
 		Password: config.Password,
 		Client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 10 * time.Minute,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -352,6 +356,10 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error)
 		return nil, fmt.Errorf("invalid parameters: %v", err)
 	}
 
+	if err := s.authorizeTool(callParams.Name, callParams.Arguments); err != nil {
+		return nil, err
+	}
+
 	var result interface{}
 	var err error
 
@@ -466,7 +474,9 @@ func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, er
 		return "", 0, fmt.Errorf("local_path is required")
 	}
 
+	if err := validateLocal(localPath, false); err != nil { return "", 0, err }
 	finalRemotePath := s.resolveRemotePath(localPath, remotePath)
+	if err := s.validateRemote(finalRemotePath); err != nil { return "", 0, err }
 
 	if err := s.ensureRemoteDirectories(finalRemotePath); err != nil {
 		return "", 0, err
@@ -477,6 +487,8 @@ func (s *MCPServer) performUpload(localPath, remotePath string) (string, int, er
 		return "", 0, fmt.Errorf("failed to open file: %v", err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<30 { return "", 0, fmt.Errorf("invalid upload source or upload exceeds 1 GiB limit") }
 
 	resp, err := s.dufsClient.makeRequest("PUT", finalRemotePath, file, nil)
 	if err != nil {
@@ -521,8 +533,20 @@ func (s *MCPServer) handleUpload(args map[string]interface{}) (interface{}, erro
 		}
 
 		s.jobsMutex.Lock()
-		s.jobs[jobID] = job
-		s.jobsMutex.Unlock()
+        if len(s.jobs) >= 128 {
+            for k, old := range s.jobs {
+                if old.Status == "completed" || old.Status == "failed" {
+                    delete(s.jobs, k)
+                }
+                if len(s.jobs) < 96 { break }
+            }
+        }
+        if len(s.jobs) >= 128 {
+            s.jobsMutex.Unlock()
+            return nil, fmt.Errorf("upload task capacity reached")
+        }
+        s.jobs[jobID] = job
+        s.jobsMutex.Unlock()
 
 		go s.runUploadJob(job)
 
@@ -627,8 +651,20 @@ func (s *MCPServer) handleUploadBatch(args map[string]interface{}) (interface{},
 	}
 
 	s.jobsMutex.Lock()
-	s.jobs[jobID] = job
-	s.jobsMutex.Unlock()
+        if len(s.jobs) >= 128 {
+            for k, old := range s.jobs {
+                if old.Status == "completed" || old.Status == "failed" {
+                    delete(s.jobs, k)
+                }
+                if len(s.jobs) < 96 { break }
+            }
+        }
+        if len(s.jobs) >= 128 {
+            s.jobsMutex.Unlock()
+            return nil, fmt.Errorf("upload task capacity reached")
+        }
+        s.jobs[jobID] = job
+        s.jobsMutex.Unlock()
 
 	go s.runUploadJob(job)
 
@@ -734,7 +770,7 @@ func (s *MCPServer) handleDownload(args map[string]interface{}) (interface{}, er
 		return nil, fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	file, err := os.Create(localPath)
+	file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local file: %v", err)
 	}
@@ -742,6 +778,8 @@ func (s *MCPServer) handleDownload(args map[string]interface{}) (interface{}, er
 
 	written, err := io.Copy(file, resp.Body)
 	if err != nil {
+		file.Close()
+		os.Remove(localPath)
 		return nil, fmt.Errorf("failed to write file: %v", err)
 	}
 
@@ -789,7 +827,7 @@ func (s *MCPServer) handleList(args map[string]interface{}) (interface{}, error)
 
 	url := path
 	if query != "" {
-		url += "?q=" + query
+		url += "?q=" + url.QueryEscape(query)
 	} else if format != "" {
 		url += "?" + format
 	}
@@ -945,7 +983,7 @@ func (s *MCPServer) handleDownloadFolder(args map[string]interface{}) (interface
 		return nil, fmt.Errorf("download folder failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	file, err := os.Create(localPath)
+	file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local file: %v", err)
 	}
@@ -953,6 +991,8 @@ func (s *MCPServer) handleDownloadFolder(args map[string]interface{}) (interface
 
 	written, err := io.Copy(file, resp.Body)
 	if err != nil {
+		file.Close()
+		os.Remove(localPath)
 		return nil, fmt.Errorf("failed to write file: %v", err)
 	}
 
@@ -1042,6 +1082,7 @@ func runStdioMode(server *MCPServer) {
 	log.SetOutput(os.Stderr)
 
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetEscapeHTML(false)
 
@@ -1092,60 +1133,63 @@ func runStdioMode(server *MCPServer) {
 	}
 }
 
-// runHTTPMode 运行 HTTP/SSE 模式
+// Legacy /message is authenticated JSON-RPC, NOT MCP Streamable HTTP.
+func newMCPHTTPHandler(server *MCPServer, token string) http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+        http.Error(w, "SSE transport is not implemented; use stdio MCP", http.StatusNotImplemented)
+    })
+    mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            w.Header().Set("Allow", "POST")
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+        var msg MCPMessage
+        if err := decoder.Decode(&msg); err != nil || msg.JSONRPC != "2.0" || msg.Method == "" {
+            http.Error(w, "invalid JSON-RPC request", http.StatusBadRequest)
+            return
+        }
+        _ = json.NewEncoder(w).Encode(server.handleMessage(msg))
+    })
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("X-Content-Type-Options", "nosniff")
+        w.Header().Set("Cache-Control", "no-store")
+        if r.Header.Get("Origin") != "" {
+            http.Error(w, "browser cross-origin requests not allowed", http.StatusForbidden)
+            return
+        }
+        auth := r.Header.Get("Authorization")
+        if !strings.HasPrefix(auth, "Bearer ") ||
+            subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(token)) != 1 {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
+}
+
 func runHTTPMode(server *MCPServer, port string) {
-	// SSE 端点：用于接收服务器推送的消息
-	http.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
-		// 设置 SSE headers
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "SSE not supported", http.StatusInternalServerError)
-			return
-		}
-
-		// 发送初始连接消息
-		fmt.Fprintf(w, "data: %s\n\n", `{"type":"connection","status":"connected"}`)
-		flusher.Flush()
-
-		// 保持连接打开，等待客户端关闭
-		<-r.Context().Done()
-	})
-
-	// 接收客户端消息的端点
-	http.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var msg MCPMessage
-		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		response := server.handleMessage(msg)
-		json.NewEncoder(w).Encode(response)
-	})
-
-	log.Printf("MCP Server (HTTP mode) starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+    token := os.Getenv("MCP_HTTP_TOKEN")
+    if len(token) < 32 {
+        log.Fatal("MCP_HTTP_TOKEN >=32 characters is required in HTTP mode")
+    }
+    bind := os.Getenv("MCP_HTTP_BIND")
+    if bind == "" { bind = "127.0.0.1:" + port }
+    host, _, err := net.SplitHostPort(bind)
+    if err != nil { log.Fatalf("invalid MCP_HTTP_BIND: %v", err) }
+    ip := net.ParseIP(host)
+    if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !enabled("MCP_HTTP_ALLOW_REMOTE") {
+        log.Fatal("non-loopback binding requires MCP_HTTP_ALLOW_REMOTE=true and TLS termination")
+    }
+    srv := &http.Server{
+        Addr: bind, Handler: newMCPHTTPHandler(server, token),
+        ReadHeaderTimeout: 10*time.Second, IdleTimeout: 60*time.Second,
+    }
+    log.Printf("Authenticated legacy MCP JSON-RPC listening on %s", bind)
+    log.Fatal(srv.ListenAndServe())
 }
 
 func main() {
@@ -1158,14 +1202,18 @@ func main() {
 		log.Fatal("DUFS_URL is required")
 	}
 
-	server := NewMCPServer(config)
-
 	// 根据环境变量选择运行模式
 	mode := os.Getenv("MCP_MODE")
 	if mode == "" {
 		// 默认使用 stdio 模式（标准 MCP 协议）
 		mode = "stdio"
 	}
+
+	if mode == "artifact" {
+		if err := runArtifactMode(config); err != nil { log.Fatalf("artifact gateway: %v", err) }
+		return
+	}
+	server := NewMCPServer(config)
 
 	switch mode {
 	case "stdio":
@@ -1183,6 +1231,6 @@ func main() {
 		log.Printf("Dufs URL: %s", config.DufsURL)
 		runHTTPMode(server, port)
 	default:
-		log.Fatalf("Unknown MCP_MODE: %s. Supported modes: stdio, http, sse", mode)
+		log.Fatalf("Unknown MCP_MODE: %s. Supported modes: stdio, http, artifact", mode)
 	}
 }
