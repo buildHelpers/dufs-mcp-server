@@ -132,7 +132,7 @@ func TestMCPDownloadAndHTTPFailure(t *testing.T) {
     if _, err := os.Stat(filepath.Join(local, "broken.bin")); !os.IsNotExist(err) { t.Fatalf("partial download retained: %v", err) }
 }
 
-func TestMCPUplodRequiresOptInAndScopedFile(t *testing.T) {
+func TestMCPUploadRequiresOptInAndScopedFile(t *testing.T) {
     local := configureReadOnly(t)
     t.Setenv("DUFS_MCP_ENABLE_UPLOAD", "true")
     payload := []byte("direct MCP upload only when explicitly authorized")
@@ -245,4 +245,73 @@ func TestUploadTaskCapacity(t *testing.T) {
     }
     assertIsError(t, toolResult(t, s, "dufs_upload", map[string]interface{}{"local_path": "f", "async": true}), true)
     if len(s.jobs) != 128 { t.Fatal("upload capacity exceeded") }
+}
+
+func TestProjectScopedUploadsNeverCreateParentDirectory(t *testing.T) {
+    local := configureReadOnly(t)
+    t.Setenv("DUFS_REMOTE_ROOT", "projects/apios")
+    t.Setenv("DUFS_MCP_ENABLE_UPLOAD", "true")
+    if err := os.WriteFile(filepath.Join(local, "artifact.txt"), []byte("artifact"), 0600); err != nil { t.Fatal(err) }
+    calls := make(chan string, 8)
+    upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        calls <- r.Method + " " + r.URL.Path
+        if r.Method == "MKCOL" {
+            if r.URL.Path == "/projects" || r.URL.Path == "/projects/apios" {
+                http.Error(w, "must not create project parents", http.StatusForbidden)
+                return
+            }
+            w.WriteHeader(http.StatusCreated)
+            return
+        }
+        if r.Method == "PUT" { w.WriteHeader(http.StatusCreated); return }
+        http.NotFound(w, r)
+    }))
+    defer upstream.Close()
+    s := NewMCPServer(Config{DufsURL: upstream.URL})
+    assertIsError(t, toolResult(t, s, "dufs_upload", map[string]interface{}{
+        "local_path": "artifact.txt", "remote_path": "projects/apios/20261115/artifact.txt",
+    }), false)
+    if n := len(calls); n != 2 { t.Fatalf("expected only scoped mkdir and PUT, got %d calls", n) }
+    a, b := <-calls, <-calls
+    if a != "MKCOL /projects/apios/20261115" || b != "PUT /projects/apios/20261115/artifact.txt" {
+        t.Fatalf("unexpected upstream operations: %q, %q", a, b)
+    }
+}
+
+func TestToolsListOnlyAdvertisesAuthorizedOperations(t *testing.T) {
+    t.Setenv("DUFS_LOCAL_ROOT", "")
+    t.Setenv("DUFS_MCP_ENABLE_UPLOAD", "")
+    t.Setenv("DUFS_MCP_ENABLE_DELETE", "")
+    t.Setenv("DUFS_MCP_ENABLE_MOVE", "")
+    s := NewMCPServer(Config{})
+    get := func() map[string]bool {
+        raw, err := s.handleToolsList(nil)
+        if err != nil { t.Fatal(err) }
+        result, ok := raw.(map[string]interface{})
+        if !ok { t.Fatal("invalid list result") }
+        names := map[string]bool{}
+        for _, tool := range result["tools"].([]MCPTool) { names[tool.Name] = true }
+        return names
+    }
+    names := get()
+    if !names["dufs_list"] || names["dufs_download"] || names["dufs_delete"] || names["dufs_upload"] {
+        t.Fatalf("unsafe capabilities advertised by default: %#v", names)
+    }
+    root := t.TempDir()
+    t.Setenv("DUFS_LOCAL_ROOT", root)
+    t.Setenv("DUFS_MCP_ENABLE_UPLOAD", "true")
+    names = get()
+    if !names["dufs_download"] || !names["dufs_upload"] || names["dufs_delete"] {
+        t.Fatalf("capabilities inconsistent with configured permissions: %#v", names)
+    }
+}
+
+func TestUnhealthyServiceReportsToolError(t *testing.T) {
+    configureReadOnly(t)
+    upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusServiceUnavailable)
+    }))
+    defer upstream.Close()
+    s := NewMCPServer(Config{DufsURL: upstream.URL})
+    assertIsError(t, toolResult(t, s, "dufs_health", map[string]interface{}{}), true)
 }
