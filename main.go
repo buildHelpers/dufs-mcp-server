@@ -747,46 +747,20 @@ func (s *MCPServer) runUploadJob(job *UploadJob) {
 }
 
 func (s *MCPServer) handleDownload(args map[string]interface{}) (interface{}, error) {
-	remotePath, ok := args["remote_path"].(string)
-	if !ok {
-		return nil, fmt.Errorf("remote_path is required")
-	}
-
-	localPath, _ := args["local_path"].(string)
-	if localPath == "" {
-		localPath = strings.TrimPrefix(strings.TrimPrefix(remotePath, "/"), "./")
-		localPath = strings.ReplaceAll(localPath, "/", "_")
-	}
-
-	resp, err := s.dufsClient.makeRequest("GET", remotePath, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("download failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	file, err := os.Create(localPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create local file: %v", err)
-	}
-	defer file.Close()
-
-	written, err := io.Copy(file, resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write file: %v", err)
-	}
-
-	return map[string]interface{}{
-		"success":    true,
-		"message":    fmt.Sprintf("File downloaded successfully to %s", localPath),
-		"local_path": localPath,
-		"size_bytes": written,
-		"status":     resp.StatusCode,
-	}, nil
+    remotePath, ok := args["remote_path"].(string)
+    if !ok || s.validateRemote(remotePath) != nil { return nil, fmt.Errorf("invalid remote_path") }
+    localPath, ok := args["local_path"].(string)
+    if !ok || localPath == "" { return nil, fmt.Errorf("local_path is required") }
+    resp, err := s.dufsClient.makeRequest("GET", remotePath, nil, nil)
+    if err != nil { return nil, fmt.Errorf("download failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != 200 { return nil, fmt.Errorf("download failed with HTTP %d", resp.StatusCode) }
+    if resp.ContentLength > maxMCPFileBytes { return nil, fmt.Errorf("download exceeds 1 GiB limit") }
+    written, err := copyScopedOutput(localPath, resp.Body)
+    if err != nil { return nil, fmt.Errorf("download failed: %w", err) }
+    return map[string]interface{}{
+        "success": true, "local_path": localPath, "size_bytes": written, "status": resp.StatusCode,
+    }, nil
 }
 
 func (s *MCPServer) handleDelete(args map[string]interface{}) (interface{}, error) {
@@ -801,10 +775,7 @@ func (s *MCPServer) handleDelete(args map[string]interface{}) (interface{}, erro
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return nil, fmt.Errorf("delete failed with HTTP %d", resp.StatusCode) }
 
 	return map[string]interface{}{
 		"success": true,
@@ -824,7 +795,7 @@ func (s *MCPServer) handleList(args map[string]interface{}) (interface{}, error)
 
 	url := path
 	if query != "" {
-		url += "?q=" + query
+		url += "?q=" + url.QueryEscape(query)
 	} else if format != "" {
 		url += "?" + format
 	}
@@ -835,15 +806,11 @@ func (s *MCPServer) handleList(args map[string]interface{}) (interface{}, error)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return nil, fmt.Errorf("list failed with HTTP %d", resp.StatusCode) }
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (2<<20)+1))
+    if err != nil { return nil, fmt.Errorf("failed to read response: %v", err) }
+    if len(body) > 2<<20 { return nil, fmt.Errorf("directory listing exceeds 2 MiB limit") }
 
 	var result interface{}
 	if format == "json" {
@@ -882,10 +849,7 @@ func (s *MCPServer) handleCreateDir(args map[string]interface{}) (interface{}, e
 		}, nil
 	}
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("create directory failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return nil, fmt.Errorf("create directory failed with HTTP %d", resp.StatusCode) }
 
 	return map[string]interface{}{
 		"success": true,
@@ -915,10 +879,7 @@ func (s *MCPServer) handleMove(args map[string]interface{}) (interface{}, error)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("move failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return nil, fmt.Errorf("move failed with HTTP %d", resp.StatusCode) }
 
 	return map[string]interface{}{
 		"success": true,
@@ -939,12 +900,9 @@ func (s *MCPServer) handleGetHash(args map[string]interface{}) (interface{}, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get hash failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	if resp.StatusCode != 200 { return nil, fmt.Errorf("get hash failed with HTTP %d; check Dufs --allow-hash", resp.StatusCode) }
 
-	hash, err := io.ReadAll(resp.Body)
+	hash, err := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read hash: %v", err)
 	}
@@ -957,47 +915,20 @@ func (s *MCPServer) handleGetHash(args map[string]interface{}) (interface{}, err
 }
 
 func (s *MCPServer) handleDownloadFolder(args map[string]interface{}) (interface{}, error) {
-	remotePath, ok := args["remote_path"].(string)
-	if !ok {
-		return nil, fmt.Errorf("remote_path is required")
-	}
-
-	localPath, _ := args["local_path"].(string)
-	if localPath == "" {
-		folderName := strings.TrimPrefix(strings.TrimPrefix(remotePath, "/"), "./")
-		folderName = strings.ReplaceAll(folderName, "/", "_")
-		localPath = folderName + ".zip"
-	}
-
-	resp, err := s.dufsClient.makeRequest("GET", remotePath+"?zip", nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("download folder failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("download folder failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	file, err := os.Create(localPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create local file: %v", err)
-	}
-	defer file.Close()
-
-	written, err := io.Copy(file, resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write file: %v", err)
-	}
-
-	return map[string]interface{}{
-		"success":    true,
-		"message":    fmt.Sprintf("Folder downloaded successfully to %s", localPath),
-		"local_path": localPath,
-		"size_bytes": written,
-		"status":     resp.StatusCode,
-	}, nil
+    remotePath, ok := args["remote_path"].(string)
+    if !ok || s.validateRemote(remotePath) != nil { return nil, fmt.Errorf("invalid remote_path") }
+    localPath, ok := args["local_path"].(string)
+    if !ok || localPath == "" { return nil, fmt.Errorf("local_path is required") }
+    resp, err := s.dufsClient.makeRequest("GET", remotePath+"?zip", nil, nil)
+    if err != nil { return nil, fmt.Errorf("download folder failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != 200 { return nil, fmt.Errorf("download folder failed with HTTP %d", resp.StatusCode) }
+    if resp.ContentLength > maxMCPFileBytes { return nil, fmt.Errorf("archive exceeds 1 GiB limit") }
+    written, err := copyScopedOutput(localPath, resp.Body)
+    if err != nil { return nil, fmt.Errorf("download folder failed: %w", err) }
+    return map[string]interface{}{
+        "success": true, "local_path": localPath, "size_bytes": written, "status": resp.StatusCode,
+    }, nil
 }
 
 func (s *MCPServer) handleHealth(args map[string]interface{}) (interface{}, error) {
@@ -1077,6 +1008,7 @@ func runStdioMode(server *MCPServer) {
 	log.SetOutput(os.Stderr)
 
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetEscapeHTML(false)
 
