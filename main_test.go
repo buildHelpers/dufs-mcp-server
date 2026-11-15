@@ -137,7 +137,7 @@ func TestMCPUplodRequiresOptInAndScopedFile(t *testing.T) {
     t.Setenv("DUFS_MCP_ENABLE_UPLOAD", "true")
     payload := []byte("direct MCP upload only when explicitly authorized")
     if err := os.WriteFile(filepath.Join(local, "input.txt"), payload, 0600); err != nil { t.Fatal(err) }
-    var uploaded []byte
+    uploaded := make(chan []byte, 1)
     upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         switch r.Method {
         case "MKCOL":
@@ -146,7 +146,7 @@ func TestMCPUplodRequiresOptInAndScopedFile(t *testing.T) {
             if r.URL.Path != "/uploads/run/input.txt" { t.Errorf("unexpected PUT path: %s", r.URL.Path) }
             b, err := io.ReadAll(r.Body)
             if err != nil { t.Errorf("read upload body: %v", err) }
-            uploaded = b
+            uploaded <- b
             w.WriteHeader(http.StatusCreated)
         default:
             http.Error(w, "invalid method", http.StatusMethodNotAllowed)
@@ -155,7 +155,8 @@ func TestMCPUplodRequiresOptInAndScopedFile(t *testing.T) {
     defer upstream.Close()
     s := NewMCPServer(Config{DufsURL: upstream.URL})
     assertIsError(t, toolResult(t, s, "dufs_upload", map[string]interface{}{"local_path": "input.txt", "remote_path": "uploads/run/input.txt"}), false)
-    if !bytes.Equal(uploaded, payload) { t.Fatalf("Dufs received %q", uploaded) }
+    got := <-uploaded
+    if !bytes.Equal(got, payload) { t.Fatalf("Dufs received %q", got) }
     assertIsError(t, toolResult(t, s, "dufs_upload", map[string]interface{}{"local_path": "input.txt", "remote_path": "other/input.txt"}), true)
     assertIsError(t, toolResult(t, s, "dufs_upload", map[string]interface{}{"local_path": filepath.Join(t.TempDir(), "private"), "remote_path": "uploads/run/private"}), true)
 }
