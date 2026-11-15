@@ -102,6 +102,77 @@ MCP_MODE=http MCP_HTTP_BIND=127.0.0.1:7887 \
 
 `POST /message` 必须带 `Authorization: Bearer <token>`；默认只绑定回环地址，拒绝浏览器 `Origin` 请求、匿名调用及无上限消息体。远程监听仅供已有认证/TLS 反向代理场景，必须显式启用 `MCP_HTTP_ALLOW_REMOTE=true`，不应直接暴露公网。
 
+## 快速上手：CI 直传 Dufs（不启动 MCP）
+
+1. **单独部署 Dufs 服务本体**（本仓库只有 MCP 适配器，不包含 Dufs 服务）。在 Dufs 上预创建 `/projects/apios` 目录，并配置项目独立账号。例如只在开发机回环接口验证的示意命令：
+
+```bash
+# 仅本机示意：正式环境应将凭据移到受保护的配置，
+# 跨机器连接使用内网 HTTPS/TLS，不应公开写接口。
+dufs /srv/dufs-data -b 127.0.0.1 -p 5000 \
+  --allow-upload --allow-hash --allow-search \
+  -a 'ci_apios:REPLACE_CI_PASSWORD@/projects/apios:rw' \
+  -a 'mcp_reader:REPLACE_MCP_PASSWORD@/projects/apios:ro'
+```
+
+2. **自托管 Runner 直接 HTTP PUT**，不需要 MCP 或 AI。下面是单个构建文件的示例；使用实际内网 Dufs URL 和专属 CI 账号，将路径中的日期、运行号和随机 ID 由工作流生成：
+
+```bash
+: "${DUFS_INTERNAL_URL:?}" "${DUFS_CI_USER:?}" "${DUFS_CI_PASSWORD:?}"
+: "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+test -f dist/package.zip
+ARTIFACT_ID="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+REMOTE="projects/apios/$(date -u +%Y%m%d)/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${ARTIFACT_ID}/package.zip"
+curl --fail-with-body --show-error --silent \
+  --user "${DUFS_CI_USER}:${DUFS_CI_PASSWORD}" \
+  --upload-file dist/package.zip "${DUFS_INTERNAL_URL%/}/${REMOTE}"
+```
+
+3. **上传后要验证真实远端数据**（Dufs 需启用 `--allow-hash`）；不能仅以 HTTP PUT 2xx 判定归档成功：
+
+```bash
+LOCAL_SHA="$(sha256sum dist/package.zip | awk '{print $1}')"
+REMOTE_SHA="$(curl --fail-with-body --show-error --silent \
+  --user "${DUFS_CI_USER}:${DUFS_CI_PASSWORD}" \
+  "${DUFS_INTERNAL_URL%/}/${REMOTE}?hash" | tr -d '\r\n')"
+test "${LOCAL_SHA}" = "${REMOTE_SHA}" || { echo '远端哈希不一致' >&2; exit 1; }
+printf '验证通过: %s %s\n' "${REMOTE}" "${LOCAL_SHA}"
+```
+
+外网下载必须单独在 Caddy 配置只读路由、身份验证及 TLS，且禁止匿名下载、目录列表和写入请求。**本 PR 没有部署 Dufs/Caddy，也没有修改 APIOS PR #59 的工作流**。上面只是一段首次联调命令；接入 APIOS 时仍应保留其已有的本机归档、清单、SHA-256 校验和失败阻断逻辑。
+
+## 快速上手：智能体使用 MCP
+
+```bash
+git clone https://github.com/buildHelpers/dufs-mcp-server.git
+cd dufs-mcp-server
+git switch fix/mcp-security-20261115
+go build -o dufs-mcp-server .
+mkdir -p "$HOME/dufs-mcp-exchange"
+```
+
+在 MCP 客户端的 stdio Server 配置中，设置如下环境变量（由客户端启动可执行文件，**不是打开 Web 网页**）：
+
+```json
+{
+  "mcpServers": {
+    "dufs": {
+      "command": "/absolute/path/to/dufs-mcp-server",
+      "env": {
+        "MCP_MODE": "stdio",
+        "DUFS_URL": "https://dufs.internal.example",
+        "DUFS_USERNAME": "mcp_reader",
+        "DUFS_PASSWORD": "REPLACE_MCP_PASSWORD",
+        "DUFS_REMOTE_ROOT": "projects/apios",
+        "DUFS_LOCAL_ROOT": "/absolute/path/to/dufs-mcp-exchange"
+      }
+    }
+  }
+}
+```
+
+`command` 必须改成真实绝对路径，`DUFS_LOCAL_ROOT` 必须是已存在的目录；真实凭据应由 MCP 客户端的安全配置或凭据管理提供，不要提交到 GitHub。默认允许查询、哈希检查和向本地受限目录下载，**不允许上传、删除或移动**。MCP 工具错误不会影响 CI 直传 Dufs。
+
 ## CI、Dufs 与验收现状
 
 CI 应使用 Dufs 官方提供的 `PUT` / `GET` API（参考 [Dufs API](https://github.com/sigoden/dufs#api)），使用项目专属 ACL，落地制品仍需按原始 SHA-256 回读验证。APIOS 的本机归档/清单逻辑由其 PR #59 维护；本仓库不接管 CI 上传工作流，不生成 Caddy 配置，也不宣称已经完成外网验收。
