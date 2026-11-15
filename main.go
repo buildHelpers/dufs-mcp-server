@@ -459,8 +459,8 @@ func (s *MCPServer) ensureRemoteDirectories(remotePath string) error {
 		}
 		func() {
 			defer resp.Body.Close()
-			if resp.StatusCode >= 400 && resp.StatusCode != http.StatusMethodNotAllowed {
-				body, _ := io.ReadAll(resp.Body)
+			if (resp.StatusCode < 200 || resp.StatusCode >= 300) && resp.StatusCode != http.StatusMethodNotAllowed {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 				err = fmt.Errorf("create directory failed with status %d: %s", resp.StatusCode, string(body))
 			}
 		}()
@@ -793,14 +793,13 @@ func (s *MCPServer) handleList(args map[string]interface{}) (interface{}, error)
 	query, _ := args["query"].(string)
 	format, _ := args["format"].(string)
 
-	url := path
-	if query != "" {
-		url += "?q=" + url.QueryEscape(query)
-	} else if format != "" {
-		url += "?" + format
-	}
+	requestPath := path
+    params := []string{}
+    if query != "" { params = append(params, "q="+url.QueryEscape(query)) }
+    if format != "" { params = append(params, format) }
+    if len(params) != 0 { requestPath += "?" + strings.Join(params, "&") }
 
-	resp, err := s.dufsClient.makeRequest("GET", url, nil, nil)
+    resp, err := s.dufsClient.makeRequest("GET", requestPath, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list failed: %v", err)
 	}
@@ -841,7 +840,13 @@ func (s *MCPServer) handleCreateDir(args map[string]interface{}) (interface{}, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusMethodNotAllowed {
-		// 405 表示目录已存在，对调用方来说可以视为成功
+        // Dufs also returns 405 if MKCOL is unsupported; check the directory exists.
+        check, err := s.dufsClient.makeRequest("GET", path+"?json", nil, nil)
+        if err != nil { return nil, fmt.Errorf("directory check failed: %w", err) }
+        checkStatus := check.StatusCode
+        check.Body.Close()
+        if checkStatus != 200 { return nil, fmt.Errorf("MKCOL denied: HTTP 405, directory check HTTP %d", checkStatus) }
+        // 405 is acceptable only after independent existence verification.
 		return map[string]interface{}{
 			"success": true,
 			"message": fmt.Sprintf("Directory %s already exists", path),
