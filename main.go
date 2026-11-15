@@ -337,15 +337,27 @@ func (s *MCPServer) handleInitialize(params json.RawMessage) (interface{}, error
 		},
 		"serverInfo": map[string]interface{}{
 			"name":    "dufs-mcp-server",
-			"version": "1.0.0",
+			"version": "1.1.0",
 		},
 	}, nil
 }
 
 func (s *MCPServer) handleToolsList(params json.RawMessage) (interface{}, error) {
-	return map[string]interface{}{
-		"tools": s.tools,
-	}, nil
+    available := make([]MCPTool, 0, len(s.tools))
+    for _, t := range s.tools {
+        switch t.Name {
+        case "dufs_upload", "dufs_upload_batch", "dufs_upload_status", "dufs_create_dir":
+            if !enabled("DUFS_MCP_ENABLE_UPLOAD") { continue }
+        case "dufs_delete":
+            if !enabled("DUFS_MCP_ENABLE_DELETE") { continue }
+        case "dufs_move":
+            if !enabled("DUFS_MCP_ENABLE_MOVE") { continue }
+        case "dufs_download", "dufs_download_folder":
+            if os.Getenv("DUFS_LOCAL_ROOT") == "" { continue }
+        }
+        available = append(available, t)
+    }
+    return map[string]interface{}{"tools": available}, nil
 }
 
 func toolCallError(err error) (interface{}, error) {
@@ -1162,7 +1174,7 @@ func main() {
 		log.Printf("MCP Server (stdio mode) starting")
 		log.Printf("Dufs URL: %s", config.DufsURL)
 		runStdioMode(server)
-	case "http", "sse":
+	case "http":
 		// HTTP/SSE 模式：通过 HTTP 端点通信
 		port := os.Getenv("PORT")
 		if port == "" {
@@ -1171,6 +1183,6 @@ func main() {
 		log.Printf("Dufs URL: %s", config.DufsURL)
 		runHTTPMode(server, port)
 	default:
-		log.Fatalf("Unknown MCP_MODE: %s. Supported modes: stdio, http, sse", mode)
+		log.Fatalf("Unknown MCP_MODE: %s. Supported modes: stdio, http", mode)
 	}
 }
