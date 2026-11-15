@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/subtle"
+	"encoding/hex"
 	"net"
 	"net/url"
 	"encoding/json"
@@ -363,6 +364,7 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, error)
 		return nil, fmt.Errorf("invalid parameters: %v", err)
 	}
 
+	if callParams.Arguments == nil { callParams.Arguments = map[string]interface{}{} }
 	if err := s.authorizeTool(callParams.Name, callParams.Arguments); err != nil {
         return toolCallError(err)
     }
@@ -908,13 +910,14 @@ func (s *MCPServer) handleGetHash(args map[string]interface{}) (interface{}, err
 	if resp.StatusCode != 200 { return nil, fmt.Errorf("get hash failed with HTTP %d; check Dufs --allow-hash", resp.StatusCode) }
 
 	hash, err := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read hash: %v", err)
-	}
+	if err != nil { return nil, fmt.Errorf("failed to read hash: %v", err) }
+	sum := strings.TrimSpace(string(hash))
+	decoded, err := hex.DecodeString(sum)
+	if err != nil || len(decoded) != 32 { return nil, fmt.Errorf("dufs did not return a valid SHA-256 digest") }
 
 	return map[string]interface{}{
 		"success": true,
-		"hash":    strings.TrimSpace(string(hash)),
+		"hash":    sum,
 		"path":    path,
 	}, nil
 }
